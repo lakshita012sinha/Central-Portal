@@ -393,19 +393,18 @@ class ULBUserCreateSerializer(serializers.Serializer):
         return user    
 
 
+
 class ULBAdminUserCreateSerializer(serializers.Serializer):
     """
-    Used by ULB_ADMIN to create an END_USER within their own ULB.
-
-    Enforces:
-    - The new user is always created as END_USER in the admin's ULB.
-    - application_ids must be a subset of apps granted to that ULB.
-    - start_date defaults to today if omitted.
-    - All records created atomically: User + ULBMembership + UserApplicationAccess (one per app).
+    Creates an END_USER within the ULB_ADMIN's ULB and assigns
+    application-specific roles wherever roles are configured.
     """
 
     username = serializers.CharField(max_length=150)
-
+    email = serializers.EmailField(
+        required=True,
+        allow_blank=False,
+    )
     password = serializers.CharField(
         write_only=True,
         style={'input_type': 'password'}
@@ -419,7 +418,14 @@ class ULBAdminUserCreateSerializer(serializers.Serializer):
     application_ids = serializers.ListField(
         child=serializers.IntegerField(),
         allow_empty=False,
-        help_text='IDs of applications to grant access to (must belong to the admin\'s ULB).'
+        help_text='IDs of applications to grant access to.'
+    )
+
+    application_roles = serializers.DictField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=dict,
+        help_text='Mapping of application ID to selected role ID.'
     )
 
     def validate_username(self, value):
@@ -430,7 +436,6 @@ class ULBAdminUserCreateSerializer(serializers.Serializer):
         return value
 
     def validate(self, attrs):
-        # Password match
         if attrs['password'] != attrs['confirm_password']:
             raise serializers.ValidationError({
                 'confirm_password': 'Passwords do not match.'
@@ -438,7 +443,6 @@ class ULBAdminUserCreateSerializer(serializers.Serializer):
 
         validate_password(attrs['password'])
 
-        # Resolve which ULB this admin belongs to
         request = self.context['request']
 
         from access_control.permissions import get_ulb_admin_membership
@@ -456,24 +460,28 @@ class ULBAdminUserCreateSerializer(serializers.Serializer):
                 'Your ULB is not active.'
             )
 
-        # Validate requested application_ids are all granted to this ULB.
-        # Check both ULBApplication (primary) AND ULBApplicationAccess (secondary).
         from ulbs.models import ULBApplication
-        from access_control.models import ULBApplicationAccess
+        from access_control.models import (
+            ULBApplicationAccess,
+            Role,
+        )
         from applications.models import Application
 
         requested_ids = set(attrs['application_ids'])
 
-        # Gather app IDs from ULBApplication (ulb_grants)
+        if len(requested_ids) != len(attrs['application_ids']):
+            raise serializers.ValidationError({
+                'application_ids': 'Duplicate application IDs are not allowed.'
+            })
+
         granted_via_ulb_app = set(
             ULBApplication.objects
             .filter(ulb=ulb, status='ACTIVE')
             .values_list('application_id', flat=True)
         )
 
-        # Gather app IDs from ULBApplicationAccess (ulb_access)
-        from django.utils import timezone
         today = timezone.localdate()
+
         granted_via_access = set(
             ULBApplicationAccess.objects
             .filter(
@@ -490,39 +498,116 @@ class ULBAdminUserCreateSerializer(serializers.Serializer):
         all_granted = granted_via_ulb_app | granted_via_access
 
         not_allowed = requested_ids - all_granted
+
         if not_allowed:
             raise serializers.ValidationError({
                 'application_ids': (
-                    f'Application(s) {sorted(not_allowed)} are not granted to your ULB.'
+                    f'Application(s) {sorted(not_allowed)} '
+                    'are not granted to your ULB.'
                 )
             })
 
-        # Verify all IDs actually exist as Application objects
         found_apps = list(
-            Application.objects
-            .filter(id__in=requested_ids, status='ACTIVE')
+            Application.objects.filter(
+                id__in=requested_ids,
+                status='ACTIVE'
+            )
         )
 
         if len(found_apps) != len(requested_ids):
-            found_ids = {a.id for a in found_apps}
+            found_ids = {app.id for app in found_apps}
             missing = requested_ids - found_ids
+
             raise serializers.ValidationError({
-                'application_ids': f'Application(s) {sorted(missing)} not found or inactive.'
+                'application_ids': (
+                    f'Application(s) {sorted(missing)} '
+                    'not found or inactive.'
+                )
             })
+
+        # Validate application-specific role selections.
+        submitted_roles = attrs.get('application_roles', {})
+
+        try:
+            submitted_roles = {
+                int(app_id): role_id
+                for app_id, role_id in submitted_roles.items()
+            }
+        except (ValueError, TypeError):
+            raise serializers.ValidationError({
+                'application_roles': 'Invalid application or role ID.'
+            })
+
+        invalid_app_ids = set(submitted_roles.keys()) - requested_ids
+
+        if invalid_app_ids:
+            raise serializers.ValidationError({
+                'application_roles': (
+                    'Roles cannot be assigned to applications '
+                    f'not selected: {sorted(invalid_app_ids)}.'
+                )
+            })
+
+        available_roles = Role.objects.filter(
+            application_id__in=requested_ids,
+            role_type='APPLICATION',
+            is_active=True,
+        ).filter(
+            Q(ulb__isnull=True) | Q(ulb=ulb)
+        )
+
+        roles_by_app = {}
+
+        for role in available_roles:
+            roles_by_app.setdefault(role.application_id, set()).add(role.id)
+
+        for app in found_apps:
+            app_roles = roles_by_app.get(app.id, set())
+            selected_role_id = submitted_roles.get(app.id)
+
+            if app_roles and selected_role_id is None:
+                raise serializers.ValidationError({
+                    'application_roles': (
+                        f'Please select a role for {app.application_name}.'
+                    )
+                })
+
+            if selected_role_id is not None and selected_role_id not in app_roles:
+                raise serializers.ValidationError({
+                    'application_roles': (
+                        f'Invalid role selected for {app.application_name}.'
+                    )
+                })
+
+        role_objects = {}
+
+        if submitted_roles:
+            role_objects = {
+                role.id: role
+                for role in available_roles.filter(
+                    id__in=submitted_roles.values()
+                )
+            }
 
         attrs['_ulb'] = ulb
         attrs['_applications'] = found_apps
+        attrs['_application_roles'] = {
+            app_id: role_objects[role_id]
+            for app_id, role_id in submitted_roles.items()
+        }
+
         return attrs
 
     @transaction.atomic
     def create(self, validated_data):
-        ulb         = validated_data['_ulb']
+        ulb = validated_data['_ulb']
         applications = validated_data['_applications']
-        password    = validated_data['password']
+        application_roles = validated_data['_application_roles']
 
         user = User.objects.create_user(
             username=validated_data['username'],
-            password=password,
+            email=validated_data['email'],
+            password=validated_data['password'],
             is_active=True,
             force_password_change=True,
         )
@@ -534,16 +619,14 @@ class ULBAdminUserCreateSerializer(serializers.Serializer):
             is_active=True,
         )
 
-        from django.utils import timezone
         today = timezone.localdate()
 
-        from access_control.models import UserApplicationAccess
         for app in applications:
             UserApplicationAccess.objects.create(
                 user=user,
                 ulb=ulb,
                 application=app,
-                role=None,
+                role=application_roles.get(app.id),
                 start_date=today,
                 end_date=None,
                 is_active=True,

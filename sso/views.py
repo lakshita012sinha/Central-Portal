@@ -1,11 +1,13 @@
-from django.views.decorators.csrf import csrf_exempt
+﻿from django.views.decorators.csrf import csrf_exempt
 from datetime import timedelta
 from django.contrib.auth.decorators import login_required
 from django.db import models, transaction
 from django.http import JsonResponse
 from django.shortcuts import redirect
+from urllib.parse import urlencode
 from django.utils import timezone
 
+import json
 from access_control.models import (
     ULBApplicationAccess,
     UserApplicationAccess,
@@ -36,7 +38,7 @@ def authorize(request):
         )
 
     #  Validate SSO Client
-    
+
 
     try:
         client = SSOClient.objects.select_related(
@@ -53,7 +55,7 @@ def authorize(request):
             status=400
         )
 
-    
+
     # Validate Redirect URI
 
     if redirect_uri != client.allowed_redirect_uri:
@@ -70,7 +72,7 @@ def authorize(request):
              },
              status=403
        )
-    
+
     # Get User's ULB Membership
 
 
@@ -127,7 +129,7 @@ def authorize(request):
             status=403
         )
 
-    #Validate ULB → Application Grant
+    #Validate ULB â†’ Application Grant
 
     ulb_application = (
         ULBApplicationAccess.objects
@@ -166,7 +168,7 @@ def authorize(request):
             status=403
         )
 
-    # Validate User → Application Access
+    # Validate User â†’ Application Access
 
     user_access = (
         UserApplicationAccess.objects
@@ -223,13 +225,22 @@ def authorize(request):
 
     # Redirect to Application
 
-    separator = '&' if '?' in redirect_uri else '?'
+    state = request.GET.get("state", "")
+
+    query_params = {
+    "code": str(authorization_code.code),
+    }
+
+    if state:
+        query_params["state"] = state
+
+    separator = "&" if "?" in redirect_uri else "?"
 
     redirect_url = (
         f"{redirect_uri}"
         f"{separator}"
-        f"code={authorization_code.code}"
-    )
+        f"{urlencode(query_params)}"
+        )
 
     return redirect(redirect_url)
 
@@ -244,10 +255,27 @@ def token(request):
             status=405
         )
 
-    client_id = request.POST.get('client_id')
-    client_secret = request.POST.get('client_secret')
-    code = request.POST.get('code')
-    redirect_uri = request.POST.get('redirect_uri')
+    if request.content_type == 'application/json':
+        try:
+            data = json.loads(request.body.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JsonResponse(
+                {
+                    'error': 'invalid_request',
+                    'error_description': 'Invalid JSON request body.'
+                },
+                status=400
+            )
+
+        client_id = data.get('client_id')
+        client_secret = data.get('client_secret')
+        code = data.get('code')
+        redirect_uri = data.get('redirect_uri')
+    else:
+        client_id = request.POST.get('client_id')
+        client_secret = request.POST.get('client_secret')
+        code = request.POST.get('code')
+        redirect_uri = request.POST.get('redirect_uri')
 
     # Validate required parameters
 
@@ -453,7 +481,7 @@ def token(request):
             status=403
         )
 
-    # Validate ULB → Application Access
+    # Validate ULB â†’ Application Access
 
     ulb_application = (
         ULBApplicationAccess.objects
@@ -479,7 +507,7 @@ def token(request):
             status=403
         )
 
-    # Validate User → Application Access
+    # Validate User â†’ Application Access
 
     user_access = (
         UserApplicationAccess.objects
@@ -506,6 +534,29 @@ def token(request):
             },
             status=403
         )
+        # Validate the selected application role.
+        selected_role = user_access.role
+
+        if (
+            not selected_role
+            or not selected_role.is_active
+            or selected_role.role_type != 'APPLICATION'
+            or selected_role.application_id != client.application_id
+            or (
+                selected_role.ulb_id is not None
+                and selected_role.ulb_id != ulb.id
+            )
+        ):
+            return JsonResponse(
+                {
+                    'error': 'access_denied',
+                    'error_description': (
+                        'A valid application-specific role has not been assigned '
+                        'to this user for this ULB.'
+                    )
+                },
+                status=403
+            )
 
     # Atomically mark authorization code as USED
 
@@ -580,7 +631,7 @@ def token(request):
     )
 
 
-# ── SSO Client CRUD ────────────────────────────────────────────────────────────
+# â”€â”€ SSO Client CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 from rest_framework import generics
 from rest_framework.permissions import IsAuthenticated
@@ -589,7 +640,7 @@ from .serializers import SSOClientSerializer, SSOAuthorizationCodeSerializer
 
 
 class SSOClientListCreateView(generics.ListCreateAPIView):
-    """GET — any authenticated user. POST — Super Admin only."""
+    """GET â€” any authenticated user. POST â€” Super Admin only."""
 
     queryset = (
         SSOClient.objects
@@ -606,7 +657,7 @@ class SSOClientListCreateView(generics.ListCreateAPIView):
 
 
 class SSOClientDetailView(generics.RetrieveUpdateAPIView):
-    """GET — any authenticated user. PUT/PATCH — Super Admin only."""
+    """GET â€” any authenticated user. PUT/PATCH â€” Super Admin only."""
 
     queryset = SSOClient.objects.select_related('application').all()
     serializer_class = SSOClientSerializer

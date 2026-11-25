@@ -1,10 +1,13 @@
-from django.contrib.auth import login, logout, authenticate
+from django.contrib.auth import apps, login, logout, authenticate
 from django.shortcuts import render, redirect
 from django.views import View
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from access_control.models import Role
+from applications.serializers import ApplicationSerializer
 
 
 from .serializers import (
@@ -370,7 +373,7 @@ class ULBAdminULBAppsView(APIView):
         from django.utils import timezone
         from django.db.models import Q
         from ulbs.models import ULBApplication
-        from access_control.models import ULBApplicationAccess
+        from access_control.models import ULBApplicationAccess, Role
         from applications.models import Application
 
         today = timezone.localdate()
@@ -399,10 +402,31 @@ class ULBAdminULBAppsView(APIView):
         )
 
         from applications.serializers import ApplicationSerializer
-        return Response(
-            ApplicationSerializer(apps, many=True).data,
-            status=status.HTTP_200_OK
-        )
+
+        app_list = list(apps)
+        app_data = ApplicationSerializer(app_list, many=True).data
+
+        roles = Role.objects.filter(
+            application_id__in=[app.id for app in app_list],
+            role_type='APPLICATION',
+            is_active=True,
+        ).filter(
+            Q(ulb__isnull=True) | Q(ulb=ulb)
+        ).order_by('role_name')
+
+        roles_by_app = {}
+
+        for role in roles:
+            roles_by_app.setdefault(role.application_id, []).append({
+                'id': role.id,
+                'role_name': role.role_name,
+                'role_code': role.role_code,
+            })
+
+        for item in app_data:
+            item['roles'] = roles_by_app.get(item['id'], [])
+
+        return Response(app_data, status=status.HTTP_200_OK)
 
 
 # ── END USER: my apps with SSO launch info ────────────────────────────────────

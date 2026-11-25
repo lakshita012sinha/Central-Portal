@@ -1,6 +1,8 @@
+from django.db import transaction
 from rest_framework import serializers
 
 from .models import ULB, ULBDatabaseConfiguration, ULBApplication
+from access_control.models import ULBApplicationAccess
 
 
 class ULBSerializer(serializers.ModelSerializer):
@@ -137,3 +139,26 @@ class ULBApplicationSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
+
+    def _sync_access(self, grant):
+        ULBApplicationAccess.objects.update_or_create(
+            ulb=grant.ulb,
+            application=grant.application,
+            defaults={
+                'start_date': grant.start_date,
+                'end_date': grant.end_date,
+                'is_active': grant.status == 'ACTIVE',
+            },
+        )
+
+    @transaction.atomic
+    def create(self, validated_data):
+        grant = super().create(validated_data)
+        self._sync_access(grant)
+        return grant
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        grant = super().update(instance, validated_data)
+        self._sync_access(grant)
+        return grant
